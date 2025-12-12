@@ -77,7 +77,7 @@ export class ReportsService {
     // Get email stats
     const { data: emailStats } = await this.supabase
       .from('campaign_emails')
-      .select('status');
+      .select('status, unsubscribed_at');
 
     const emailCounts = {
       total: emailStats?.length || 0,
@@ -88,6 +88,7 @@ export class ReportsService {
       clicked: emailStats?.filter((e) => e.status === 'clicked').length || 0,
       bounced: emailStats?.filter((e) => e.status === 'bounced').length || 0,
       failed: emailStats?.filter((e) => e.status === 'failed').length || 0,
+      unsubscribed: emailStats?.filter((e) => e.status === 'unsubscribed' || e.unsubscribed_at).length || 0,
     };
 
     // Calculate percentage changes

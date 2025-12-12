@@ -1,8 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { getSupabaseAdminClient } from '../../config/supabase.config';
-import * as nodemailer from 'nodemailer';
-import type { Transporter } from 'nodemailer';
+import { BrevoService } from './brevo.service';
 
 interface EmailToSend {
   id: string;
@@ -40,44 +39,14 @@ export class EmailSenderService implements OnModuleInit {
   private readonly logger = new Logger(EmailSenderService.name);
   private supabase = getSupabaseAdminClient();
   private activeCampaigns = new Map<string, boolean>();
-  private transporter: Transporter | null = null;
 
-  constructor(private configService: ConfigService) {}
+  constructor(
+    private configService: ConfigService,
+    private brevoService: BrevoService,
+  ) {}
 
   async onModuleInit() {
-    await this.initializeTransporter();
-  }
-
-  private async initializeTransporter(): Promise<void> {
-    const smtpHost = this.configService.get<string>('SMTP_HOST');
-    const smtpPort = this.configService.get<number>('SMTP_PORT') || 587;
-    const smtpUser = this.configService.get<string>('SMTP_USER');
-    const smtpPass = this.configService.get<string>('SMTP_PASS');
-    const smtpSecure = this.configService.get<boolean>('SMTP_SECURE') || false;
-
-    if (!smtpHost || !smtpUser || !smtpPass) {
-      this.logger.warn('SMTP configuration not found. Email sending will be simulated.');
-      return;
-    }
-
-    try {
-      this.transporter = nodemailer.createTransport({
-        host: smtpHost,
-        port: smtpPort,
-        secure: smtpSecure, // true for 465, false for other ports
-        auth: {
-          user: smtpUser,
-          pass: smtpPass,
-        },
-      });
-
-      // Verify connection
-      await this.transporter.verify();
-      this.logger.log(`SMTP connection established: ${smtpHost}:${smtpPort}`);
-    } catch (error) {
-      this.logger.error('Failed to initialize SMTP transporter:', error);
-      this.transporter = null;
-    }
+    this.logger.log('EmailSenderService initialized with Brevo integration');
   }
 
   async startSending(campaignId: string): Promise<void> {
@@ -87,7 +56,7 @@ export class EmailSenderService implements OnModuleInit {
     }
 
     this.activeCampaigns.set(campaignId, true);
-    this.logger.log(`Starting email sending for campaign ${campaignId}`);
+    this.logger.log(`Starting email sending for campaign ${campaignId} via Brevo`);
 
     try {
       await this.sendCampaignEmails(campaignId);
@@ -109,15 +78,18 @@ export class EmailSenderService implements OnModuleInit {
       .from('campaigns')
       .select(`
         *,
-        template:templates(subject, body_html, body_text, variables)
+        template:templates!campaigns_template_id_fkey(subject, body_html, body_text, variables)
       `)
       .eq('id', campaignId)
       .single();
 
     if (campaignError || !campaign) {
+      this.logger.error(`Campaign fetch error: ${JSON.stringify(campaignError)}`);
       throw new Error(`Campaign not found: ${campaignId}`);
     }
 
+    this.logger.log(`Campaign loaded: ${campaign.name}, Template: ${JSON.stringify(campaign.template)}`);
+    
     const campaignData = campaign as CampaignData;
 
     // Get pending emails with contact data
@@ -144,6 +116,7 @@ export class EmailSenderService implements OnModuleInit {
     const totalEmails = emails.length;
     let sentCount = 0;
     let failedCount = 0;
+    let skippedCount = 0;
 
     // Get current stats
     const { data: currentCampaign } = await this.supabase
@@ -160,6 +133,7 @@ export class EmailSenderService implements OnModuleInit {
       clicked: 0,
       bounced: 0,
       failed: 0,
+      unsubscribed: 0,
     };
 
     for (const email of emails as EmailToSend[]) {
@@ -181,30 +155,64 @@ export class EmailSenderService implements OnModuleInit {
         break;
       }
 
+      // Check if email is unsubscribed
+      const isUnsubscribed = await this.brevoService.isUnsubscribed(email.email_address);
+      if (isUnsubscribed) {
+        this.logger.log(`Skipping unsubscribed email: ${email.email_address}`);
+        
+        await this.supabase
+          .from('campaign_emails')
+          .update({
+            status: 'unsubscribed',
+            error_message: 'Email previously unsubscribed',
+          })
+          .eq('id', email.id);
+
+        skippedCount++;
+        continue;
+      }
+
       try {
         // Prepare email content
         const emailContent = this.prepareEmailContent(campaignData, email);
 
-        // Simulate sending (replace with actual email service)
-        await this.sendEmail(emailContent);
+        // Send via Brevo
+        const result = await this.brevoService.sendTransactionalEmail(
+          email.email_address,
+          email.recipient_name || undefined,
+          campaignData.from_email,
+          campaignData.from_name,
+          campaignData.reply_to || undefined,
+          emailContent.subject,
+          emailContent.html,
+          emailContent.text,
+          campaignId,
+          email.id,
+        );
 
-        // Update email status
-        await this.supabase
-          .from('campaign_emails')
-          .update({
-            status: 'sent',
-            sent_at: new Date().toISOString(),
-          })
-          .eq('id', email.id);
+        if (result.success) {
+          // Update email status
+          await this.supabase
+            .from('campaign_emails')
+            .update({
+              status: 'sent',
+              sent_at: new Date().toISOString(),
+              brevo_message_id: result.messageId,
+            })
+            .eq('id', email.id);
 
-        // Record sent event
-        await this.supabase.from('email_events').insert({
-          campaign_email_id: email.id,
-          event_type: 'sent',
-          occurred_at: new Date().toISOString(),
-        });
+          // Record sent event
+          await this.supabase.from('email_events').insert({
+            campaign_email_id: email.id,
+            event_type: 'sent',
+            occurred_at: new Date().toISOString(),
+            event_data: { brevo_message_id: result.messageId },
+          });
 
-        sentCount++;
+          sentCount++;
+        } else {
+          throw new Error('Brevo sending failed');
+        }
       } catch (error) {
         this.logger.error(`Failed to send email ${email.id}:`, error);
 
@@ -221,25 +229,28 @@ export class EmailSenderService implements OnModuleInit {
           campaign_email_id: email.id,
           event_type: 'failed',
           occurred_at: new Date().toISOString(),
-          metadata: { error: (error as Error).message },
+          event_data: { error: (error as Error).message },
         });
 
         failedCount++;
       }
 
-      // Update stats after each email
-      await this.supabase
-        .from('campaigns')
-        .update({
-          stats: {
-            ...currentStats,
-            sent: currentStats.sent + sentCount,
-            failed: currentStats.failed + failedCount,
-          },
-        })
-        .eq('id', campaignId);
+      // Update stats after each batch of 10 emails
+      if ((sentCount + failedCount + skippedCount) % 10 === 0) {
+        await this.supabase
+          .from('campaigns')
+          .update({
+            stats: {
+              ...currentStats,
+              sent: currentStats.sent + sentCount,
+              failed: currentStats.failed + failedCount,
+              unsubscribed: currentStats.unsubscribed + skippedCount,
+            },
+          })
+          .eq('id', campaignId);
+      }
 
-      // Small delay between emails (rate limiting)
+      // Rate limiting - Brevo allows ~300 emails/minute on free tier
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
 
@@ -250,9 +261,10 @@ export class EmailSenderService implements OnModuleInit {
       .eq('campaign_id', campaignId);
 
     if (finalStats) {
-      const sent = finalStats.filter((e) => e.status === 'sent').length;
+      const sent = finalStats.filter((e) => e.status === 'sent' || e.status === 'delivered' || e.status === 'opened' || e.status === 'clicked').length;
       const failed = finalStats.filter((e) => e.status === 'failed').length;
       const pending = finalStats.filter((e) => e.status === 'pending').length;
+      const unsubscribed = finalStats.filter((e) => e.status === 'unsubscribed').length;
 
       await this.supabase
         .from('campaigns')
@@ -262,6 +274,7 @@ export class EmailSenderService implements OnModuleInit {
             total: finalStats.length,
             sent,
             failed,
+            unsubscribed,
           },
         })
         .eq('id', campaignId);
@@ -273,17 +286,32 @@ export class EmailSenderService implements OnModuleInit {
     }
 
     this.logger.log(
-      `Campaign ${campaignId} sending complete: ${sentCount} sent, ${failedCount} failed`,
+      `Campaign ${campaignId} sending complete: ${sentCount} sent, ${failedCount} failed, ${skippedCount} skipped`,
     );
   }
 
   private prepareEmailContent(
     campaign: CampaignData,
     email: EmailToSend,
-  ): { to: string; from: string; replyTo?: string; subject: string; html: string; text: string } {
+  ): { subject: string; html: string; text: string } {
     const template = campaign.template;
+    
+    // Debug logging
+    this.logger.debug(`Campaign data: ${JSON.stringify({
+      id: campaign.id,
+      subject_override: campaign.subject_override,
+      template_id: campaign.template_id,
+      hasTemplate: !!template,
+      templateSubject: template?.subject,
+    })}`);
+    
     if (!template) {
       throw new Error('Template not found');
+    }
+    
+    if (!template.subject && !campaign.subject_override) {
+      this.logger.error(`No subject found for campaign ${campaign.id}. Template: ${JSON.stringify(template)}`);
+      throw new Error('Subject is required - neither template.subject nor campaign.subject_override is set');
     }
 
     // Prepare variables for replacement
@@ -312,163 +340,26 @@ export class EmailSenderService implements OnModuleInit {
       text = text.replace(regex, value);
     }
 
-    return {
-      to: email.email_address,
-      from: `${campaign.from_name} <${campaign.from_email}>`,
-      replyTo: campaign.reply_to || undefined,
-      subject,
-      html,
-      text,
-    };
-  }
-
-  private async sendEmail(content: {
-    to: string;
-    from: string;
-    replyTo?: string;
-    subject: string;
-    html: string;
-    text: string;
-  }): Promise<void> {
-    this.logger.debug(`Sending email to ${content.to}: ${content.subject}`);
-
-    // If no transporter configured, simulate sending
-    if (!this.transporter) {
-      this.logger.warn(`[SIMULATION] Email would be sent to ${content.to}`);
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      return;
-    }
-
-    // Send real email via Nodemailer
-    try {
-      const info = await this.transporter.sendMail({
-        from: content.from,
-        to: content.to,
-        replyTo: content.replyTo,
-        subject: content.subject,
-        html: content.html,
-        text: content.text,
-      });
-
-      this.logger.log(`Email sent successfully to ${content.to} - MessageId: ${info.messageId}`);
-    } catch (error) {
-      this.logger.error(`Failed to send email to ${content.to}:`, error);
-      throw error;
-    }
-  }
-
-  private async simulateOpen(emailId: string): Promise<void> {
-    // Simulate email being opened
-    await this.supabase
-      .from('campaign_emails')
-      .update({ opened_at: new Date().toISOString() })
-      .eq('id', emailId);
-
-    await this.supabase.from('email_events').insert({
-      campaign_email_id: emailId,
-      event_type: 'opened',
-      occurred_at: new Date().toISOString(),
-    });
-
-    // Update campaign stats
-    const { data: email } = await this.supabase
-      .from('campaign_emails')
-      .select('campaign_id')
-      .eq('id', emailId)
-      .single();
-
-    if (email) {
-      const { data: stats } = await this.supabase
-        .from('campaign_emails')
-        .select('opened_at')
-        .eq('campaign_id', email.campaign_id)
-        .not('opened_at', 'is', null);
-
-      if (stats) {
-        const { data: campaign } = await this.supabase
-          .from('campaigns')
-          .select('stats')
-          .eq('id', email.campaign_id)
-          .single();
-
-        if (campaign?.stats) {
-          await this.supabase
-            .from('campaigns')
-            .update({
-              stats: { ...campaign.stats, opened: stats.length },
-            })
-            .eq('id', email.campaign_id);
-        }
-      }
-    }
-
-    // Simulate click (30% chance if opened)
-    if (Math.random() > 0.7) {
-      setTimeout(() => this.simulateClick(emailId), Math.random() * 5000);
-    }
-  }
-
-  private async simulateClick(emailId: string): Promise<void> {
-    await this.supabase
-      .from('campaign_emails')
-      .update({ clicked_at: new Date().toISOString() })
-      .eq('id', emailId);
-
-    await this.supabase.from('email_events').insert({
-      campaign_email_id: emailId,
-      event_type: 'clicked',
-      occurred_at: new Date().toISOString(),
-    });
-
-    // Update campaign stats
-    const { data: email } = await this.supabase
-      .from('campaign_emails')
-      .select('campaign_id')
-      .eq('id', emailId)
-      .single();
-
-    if (email) {
-      const { data: stats } = await this.supabase
-        .from('campaign_emails')
-        .select('clicked_at')
-        .eq('campaign_id', email.campaign_id)
-        .not('clicked_at', 'is', null);
-
-      if (stats) {
-        const { data: campaign } = await this.supabase
-          .from('campaigns')
-          .select('stats')
-          .eq('id', email.campaign_id)
-          .single();
-
-        if (campaign?.stats) {
-          await this.supabase
-            .from('campaigns')
-            .update({
-              stats: { ...campaign.stats, clicked: stats.length },
-            })
-            .eq('id', email.campaign_id);
-        }
-      }
-    }
+    return { subject, html, text };
   }
 
   private async markCampaignComplete(campaignId: string): Promise<void> {
     // Final stats calculation
     const { data: emails } = await this.supabase
       .from('campaign_emails')
-      .select('status, opened_at, clicked_at')
+      .select('status, opened_at, clicked_at, unsubscribed_at')
       .eq('campaign_id', campaignId);
 
     if (emails) {
       const stats = {
         total: emails.length,
-        sent: emails.filter((e) => e.status === 'sent').length,
-        delivered: emails.filter((e) => e.status === 'sent').length, // Assume delivered = sent for now
+        sent: emails.filter((e) => ['sent', 'delivered', 'opened', 'clicked'].includes(e.status)).length,
+        delivered: emails.filter((e) => ['delivered', 'opened', 'clicked'].includes(e.status)).length,
         opened: emails.filter((e) => e.opened_at).length,
         clicked: emails.filter((e) => e.clicked_at).length,
-        bounced: 0,
+        bounced: emails.filter((e) => e.status === 'bounced').length,
         failed: emails.filter((e) => e.status === 'failed').length,
+        unsubscribed: emails.filter((e) => e.status === 'unsubscribed' || e.unsubscribed_at).length,
       };
 
       await this.supabase
