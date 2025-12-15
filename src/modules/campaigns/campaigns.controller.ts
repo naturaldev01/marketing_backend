@@ -87,6 +87,11 @@ export class CampaignsController {
     return this.campaignsService.duplicate(id, req.user.id);
   }
 
+  @Get('hello')
+  getHello() : string {
+    return "Hello World";
+  }
+
   @Get(':id/emails')
   @ApiOperation({ summary: 'Get campaign emails' })
   @ApiQuery({ name: 'status', required: false })
