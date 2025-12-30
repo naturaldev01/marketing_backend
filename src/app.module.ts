@@ -5,6 +5,7 @@ import { CampaignsModule } from './modules/campaigns/campaigns.module';
 import { CsvFilesModule } from './modules/csv-files/csv-files.module';
 import { ReportsModule } from './modules/reports/reports.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { AdvertisementsModule } from './modules/advertisements/advertisements.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { AuthModule } from './modules/auth/auth.module';
     CampaignsModule,
     CsvFilesModule,
     ReportsModule,
+    AdvertisementsModule,
   ],
   controllers: [],
   providers: [],
