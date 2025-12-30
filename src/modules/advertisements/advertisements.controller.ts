@@ -7,13 +7,12 @@ import {
   Body,
   Param,
   Req,
-  Res,
   Query,
   UseGuards,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
-import type { Request, Response } from 'express';
+import type { Request } from 'express';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiQuery } from '@nestjs/swagger';
 import { AdvertisementsService } from './advertisements.service';
 import {
@@ -28,62 +27,8 @@ export class AdvertisementsController {
   constructor(private readonly adsService: AdvertisementsService) {}
 
   // ============================================
-  // PUBLIC ENDPOINT - Track click and redirect
-  // ============================================
-  @Get('g/:code')
-  @ApiOperation({ summary: 'Track click and redirect to destination URL' })
-  async trackAndRedirect(
-    @Param('code') code: string,
-    @Req() req: Request,
-    @Res() res: Response,
-  ) {
-    const ad = await this.adsService.findByTrackingCode(code);
-
-    if (!ad) {
-      return res.status(404).send(`
-        <!DOCTYPE html>
-        <html>
-          <head><title>Not Found</title></head>
-          <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-            <h1>Link Not Found</h1>
-            <p>This advertisement link is no longer active or doesn't exist.</p>
-          </body>
-        </html>
-      `);
-    }
-
-    // Build destination URL with UTM parameters
-    let destinationUrl = ad.destination_url;
-    const utmParams = new URLSearchParams();
-
-    if (ad.utm_source) utmParams.append('utm_source', ad.utm_source);
-    if (ad.utm_medium) utmParams.append('utm_medium', ad.utm_medium);
-    if (ad.utm_campaign) utmParams.append('utm_campaign', ad.utm_campaign);
-
-    if (utmParams.toString()) {
-      const separator = destinationUrl.includes('?') ? '&' : '?';
-      destinationUrl += separator + utmParams.toString();
-    }
-
-    // Record click asynchronously (don't await)
-    const forwardedFor = req.headers['x-forwarded-for'];
-    const ipAddress =
-      typeof forwardedFor === 'string'
-        ? forwardedFor.split(',')[0].trim()
-        : req.ip;
-
-    this.adsService.recordClick(ad.id, {
-      ip_address: ipAddress,
-      user_agent: req.headers['user-agent'],
-      referrer: req.headers['referer'],
-    });
-
-    // Redirect to destination
-    return res.redirect(302, destinationUrl);
-  }
-
-  // ============================================
   // PROTECTED ENDPOINTS - CRUD Operations
+  // Tracking endpoint is in TrackingController (root level)
   // ============================================
 
   @Post('advertisements')
