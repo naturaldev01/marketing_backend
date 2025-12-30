@@ -30,7 +30,7 @@ export class AdvertisementsController {
   // ============================================
   // PUBLIC ENDPOINT - Track click and redirect
   // ============================================
-  @Get('go/:code')
+  @Get('g/:code')
   @ApiOperation({ summary: 'Track click and redirect to destination URL' })
   async trackAndRedirect(
     @Param('code') code: string,

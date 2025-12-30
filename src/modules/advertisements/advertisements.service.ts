@@ -3,8 +3,8 @@ import { getSupabaseAdminClient } from '../../config/supabase.config';
 import { CreateAdvertisementDto, UpdateAdvertisementDto } from './dto/advertisement.dto';
 import { randomBytes } from 'crypto';
 
-// Generate a short, URL-safe tracking code
-function generateTrackingCode(length: number = 8): string {
+// Generate a short, URL-safe tracking code (6 characters)
+function generateTrackingCode(length: number = 6): string {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   const bytes = randomBytes(length);
   let result = '';
